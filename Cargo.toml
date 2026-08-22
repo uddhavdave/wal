@@ -1,0 +1,7 @@
+[package]
+name = "wal_writer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ksuid = "0.2.0"
