@@ -12,14 +12,23 @@ use std::string::FromUtf8Error;
 #[derive(Debug)]
 pub enum WriteError {
     Io(io::Error),
-    /// A segment with this name already exists. Two writers appending to one
-    /// segment is a corrupt log, so this is refused rather than resumed.
-    AlreadyExists { path: PathBuf },
+    /// A segment with this name already exists. Two writers racing to create
+    /// the same next file is a corrupt log, so this is refused rather than
+    /// resumed.
+    AlreadyExists {
+        path: PathBuf,
+    },
+    /// Matching `{seq:08}.wal` names in the directory are not contiguous `1..=n`.
+    MissingSegment {
+        seq: u64,
+    },
     /// Zero-length records carry no information, and forbidding them means
     /// `len == 0` is *always* an invalid frame — a cheap second signal that the
     /// reader is looking at padding rather than data.
     EmptyRecord,
-    RecordTooLarge { len: usize },
+    RecordTooLarge {
+        len: usize,
+    },
 }
 
 impl fmt::Display for WriteError {
@@ -28,6 +37,9 @@ impl fmt::Display for WriteError {
             Self::Io(e) => write!(f, "wal write: {e}"),
             Self::AlreadyExists { path } => {
                 write!(f, "wal segment already exists: {}", path.display())
+            }
+            Self::MissingSegment { seq } => {
+                write!(f, "wal write: missing segment {seq:08}")
             }
             Self::EmptyRecord => write!(f, "wal write: empty records are not allowed"),
             Self::RecordTooLarge { len } => write!(
@@ -54,16 +66,21 @@ impl From<io::Error> for WriteError {
     }
 }
 
-/// Failures that can occur while iterating a segment.
+/// Failures that can occur while iterating a log.
 ///
-/// Every variant that indicates damage carries the byte `offset` of the frame it
-/// was found at; diagnosing a corrupt log without a location is close to
-/// impossible.
+/// Every variant that indicates damage carries the segment `path` and the byte
+/// `offset` of the frame it was found at; diagnosing a corrupt log without a
+/// location is close to impossible. Offset is per-file.
 #[derive(Debug)]
 pub enum ReadError {
     Io(io::Error),
-    /// The bytes at `offset` did not match their checksum. Something rotted.
+    /// Matching `{seq:08}.wal` names in the directory are not contiguous `1..=n`.
+    MissingSegment {
+        seq: u64,
+    },
+    /// The bytes at `offset` in `path` did not match their checksum. Something rotted.
     ChecksumMismatch {
+        path: PathBuf,
         offset: u64,
         expected: u32,
         actual: u32,
@@ -73,13 +90,21 @@ pub enum ReadError {
     /// This is *normal* — it is what a crash mid-append looks like on disk — and
     /// is deliberately distinct from [`ReadError::ChecksumMismatch`] so a caller
     /// can tell "we crashed here" from "these bytes are damaged".
-    TruncatedTail { offset: u64 },
+    TruncatedTail {
+        path: PathBuf,
+        offset: u64,
+    },
     /// The length prefix at `offset` is not a value the writer could have
     /// produced. Checked *before* allocating, since the checksum cannot vouch
     /// for a length until `len` bytes have already been read.
-    InvalidLength { offset: u64, len: u32 },
+    InvalidLength {
+        path: PathBuf,
+        offset: u64,
+        len: u32,
+    },
     /// Only produced by [`crate::WalReader::strings`].
     InvalidUtf8 {
+        path: PathBuf,
         offset: u64,
         source: FromUtf8Error,
     },
@@ -89,23 +114,44 @@ impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "wal read: {e}"),
+            Self::MissingSegment { seq } => {
+                write!(f, "wal read: missing segment {seq:08}")
+            }
             Self::ChecksumMismatch {
+                path,
                 offset,
                 expected,
                 actual,
             } => write!(
                 f,
-                "wal read: checksum mismatch at offset {offset} \
-                 (stored {expected:#010x}, computed {actual:#010x})"
+                "wal read: checksum mismatch in {} at offset {offset} \
+                 (stored {expected:#010x}, computed {actual:#010x})",
+                path.display()
             ),
-            Self::TruncatedTail { offset } => {
-                write!(f, "wal read: truncated frame at offset {offset}")
+            Self::TruncatedTail { path, offset } => {
+                write!(
+                    f,
+                    "wal read: truncated frame in {} at offset {offset}",
+                    path.display()
+                )
             }
-            Self::InvalidLength { offset, len } => {
-                write!(f, "wal read: invalid record length {len} at offset {offset}")
+            Self::InvalidLength { path, offset, len } => {
+                write!(
+                    f,
+                    "wal read: invalid record length {len} in {} at offset {offset}",
+                    path.display()
+                )
             }
-            Self::InvalidUtf8 { offset, source } => {
-                write!(f, "wal read: record at offset {offset} is not utf-8: {source}")
+            Self::InvalidUtf8 {
+                path,
+                offset,
+                source,
+            } => {
+                write!(
+                    f,
+                    "wal read: record in {} at offset {offset} is not utf-8: {source}",
+                    path.display()
+                )
             }
         }
     }

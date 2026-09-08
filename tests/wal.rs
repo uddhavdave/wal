@@ -40,7 +40,7 @@ impl Drop for TmpDir {
 
 /// Writes `records` to a fresh segment and returns its path.
 fn segment(dir: &TmpDir, records: &[&[u8]]) -> PathBuf {
-    let mut wal = WalWriter::new(dir.path(), "test.wal").unwrap();
+    let mut wal = WalWriter::new(dir.path()).unwrap();
     for record in records {
         wal.push(record).unwrap();
     }
@@ -55,7 +55,12 @@ fn two_records(dir: &TmpDir) -> PathBuf {
 }
 
 fn truncate_to(path: &Path, len: u64) {
-    File::options().write(true).open(path).unwrap().set_len(len).unwrap();
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
 }
 
 fn flip_bit(path: &Path, at: u64) {
@@ -81,8 +86,12 @@ fn append_zeros(path: &Path, n: usize) {
 /// forever, an unbounded `collect()` here would exhaust the machine's memory
 /// rather than fail a test. `iteration_ends_after_corruption` is what actually
 /// pins the termination guarantee.
-fn read_all(path: &Path) -> Vec<Result<Vec<u8>, ReadError>> {
-    WalReader::open(path).unwrap().take(64).collect()
+fn read_file(path: &Path) -> Vec<Result<Vec<u8>, ReadError>> {
+    WalReader::open_file(path).unwrap().take(64).collect()
+}
+
+fn read_dir(dir: &Path) -> Vec<Result<Vec<u8>, ReadError>> {
+    WalReader::open(dir).unwrap().take(64).collect()
 }
 
 // --- happy path -------------------------------------------------------------
@@ -92,22 +101,26 @@ fn round_trips_records_in_order() {
     let dir = TmpDir::new("roundtrip");
     let path = segment(&dir, &[b"alpha", b"beta", b"gamma"]);
 
-    let records: Vec<_> = WalReader::open(&path)
+    let records: Vec<_> = WalReader::open_file(&path)
         .unwrap()
         .map(Result::unwrap)
         .collect();
 
-    assert_eq!(records, vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+    assert_eq!(
+        records,
+        vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+    );
 }
 
 #[test]
 fn push_returns_frame_start_offsets() {
     let dir = TmpDir::new("offsets");
-    let mut wal = WalWriter::new(dir.path(), "test.wal").unwrap();
+    let mut wal = WalWriter::new(dir.path()).unwrap();
 
     assert_eq!(wal.push(b"hello").unwrap(), 0);
     assert_eq!(wal.push(b"world").unwrap(), FRAME);
     assert_eq!(wal.push(b"!").unwrap(), FRAME * 2);
+    assert!(wal.path().ends_with("00000001.wal"));
 
     wal.close().unwrap();
 }
@@ -117,7 +130,7 @@ fn strings_decodes_utf8() {
     let dir = TmpDir::new("strings");
     let path = segment(&dir, &[b"one", b"two"]);
 
-    let records: Vec<String> = WalReader::open(&path)
+    let records: Vec<String> = WalReader::open_file(&path)
         .unwrap()
         .strings()
         .map(Result::unwrap)
@@ -131,7 +144,21 @@ fn empty_segment_yields_nothing() {
     let dir = TmpDir::new("empty");
     let path = segment(&dir, &[]);
 
-    assert!(read_all(&path).is_empty());
+    assert!(read_file(&path).is_empty());
+}
+
+#[test]
+fn empty_directory_is_a_valid_empty_log() {
+    let dir = TmpDir::new("empty-dir");
+    assert!(read_dir(dir.path()).is_empty());
+}
+
+#[test]
+fn missing_directory_is_an_error() {
+    let dir = TmpDir::new("missing-dir");
+    let gone = dir.path().join("nope");
+    assert!(matches!(WalWriter::new(&gone), Err(WriteError::Io(_))));
+    assert!(matches!(WalReader::open(&gone), Err(ReadError::Io(_))));
 }
 
 // --- torn writes ------------------------------------------------------------
@@ -146,11 +173,11 @@ fn truncation_inside_length_prefix_is_a_truncated_tail() {
     let path = two_records(&dir);
     truncate_to(&path, FRAME + 2);
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
     assert!(matches!(
         results[1],
-        Err(ReadError::TruncatedTail { offset: 13 })
+        Err(ReadError::TruncatedTail { offset: 13, .. })
     ));
 }
 
@@ -160,11 +187,11 @@ fn truncation_inside_payload_is_a_truncated_tail() {
     let path = two_records(&dir);
     truncate_to(&path, FRAME + 4 + 2);
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
     assert!(matches!(
         results[1],
-        Err(ReadError::TruncatedTail { offset: 13 })
+        Err(ReadError::TruncatedTail { offset: 13, .. })
     ));
 }
 
@@ -174,11 +201,11 @@ fn truncation_inside_checksum_is_a_truncated_tail() {
     let path = two_records(&dir);
     truncate_to(&path, FRAME + 4 + 5 + 2);
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
     assert!(matches!(
         results[1],
-        Err(ReadError::TruncatedTail { offset: 13 })
+        Err(ReadError::TruncatedTail { offset: 13, .. })
     ));
 }
 
@@ -190,7 +217,7 @@ fn corrupt_payload_is_a_checksum_mismatch() {
     let path = two_records(&dir);
     flip_bit(&path, FRAME + 4); // first byte of the second record's payload
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
     assert!(matches!(
         results[1],
@@ -207,12 +234,12 @@ fn corrupt_length_prefix_is_caught_by_the_checksum() {
     let path = two_records(&dir);
     flip_bit(&path, FRAME); // low byte of the second record's length
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
     assert!(matches!(
         results[1],
         Err(ReadError::ChecksumMismatch { offset: 13, .. })
-            | Err(ReadError::TruncatedTail { offset: 13 })
+            | Err(ReadError::TruncatedTail { offset: 13, .. })
     ));
 }
 
@@ -225,7 +252,7 @@ fn iteration_ends_after_corruption() {
     let path = two_records(&dir);
     flip_bit(&path, FRAME + 4);
 
-    let mut reader = WalReader::open(&path).unwrap();
+    let mut reader = WalReader::open_file(&path).unwrap();
     assert_eq!(reader.next().unwrap().unwrap(), b"hello");
     assert!(matches!(
         reader.next(),
@@ -237,32 +264,6 @@ fn iteration_ends_after_corruption() {
     for _ in 0..3 {
         assert!(reader.next().is_none());
     }
-
-    // ...but the reason outlives iteration.
-    assert!(matches!(
-        reader.failure(),
-        Some(ReadError::ChecksumMismatch { offset: 13, .. })
-    ));
-}
-
-#[test]
-fn failure_distinguishes_clean_eof_from_damage() {
-    let dir = TmpDir::new("failure");
-
-    let clean = segment(&dir, &[b"hello"]);
-    let mut reader = WalReader::open(&clean).unwrap();
-    while reader.next().is_some() {}
-    assert!(reader.failure().is_none(), "clean EOF is not a failure");
-
-    let torn = TmpDir::new("failure-torn");
-    let path = two_records(&torn);
-    truncate_to(&path, FRAME + 2);
-    let mut reader = WalReader::open(&path).unwrap();
-    while reader.next().is_some() {}
-    assert!(matches!(
-        reader.failure(),
-        Some(ReadError::TruncatedTail { offset: 13 })
-    ));
 }
 
 #[test]
@@ -275,12 +276,33 @@ fn zero_filled_tail_is_rejected() {
     let path = segment(&dir, &[b"hello"]);
     append_zeros(&path, 64);
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
     assert!(matches!(
         results[1],
-        Err(ReadError::InvalidLength { offset: 13, len: 0 })
+        Err(ReadError::InvalidLength {
+            offset: 13,
+            len: 0,
+            ..
+        })
     ));
+}
+
+#[test]
+fn damage_errors_name_the_torn_file() {
+    let dir = TmpDir::new("error-path");
+    let path = two_records(&dir);
+    truncate_to(&path, FRAME + 2);
+
+    match &read_file(&path)[1] {
+        Err(ReadError::TruncatedTail {
+            path: err_path,
+            offset: 13,
+        }) => {
+            assert_eq!(err_path, &path);
+        }
+        other => panic!("expected TruncatedTail, got {other:?}"),
+    }
 }
 
 // --- write-side rejections --------------------------------------------------
@@ -288,7 +310,7 @@ fn zero_filled_tail_is_rejected() {
 #[test]
 fn empty_records_are_rejected() {
     let dir = TmpDir::new("reject-empty");
-    let mut wal = WalWriter::new(dir.path(), "test.wal").unwrap();
+    let mut wal = WalWriter::new(dir.path()).unwrap();
 
     assert!(matches!(wal.push(b""), Err(WriteError::EmptyRecord)));
 
@@ -298,7 +320,7 @@ fn empty_records_are_rejected() {
 #[test]
 fn oversized_records_are_rejected() {
     let dir = TmpDir::new("reject-large");
-    let mut wal = WalWriter::new(dir.path(), "test.wal").unwrap();
+    let mut wal = WalWriter::new(dir.path()).unwrap();
 
     let too_big = vec![0u8; MAX_RECORD_SIZE + 1];
     assert!(matches!(
@@ -309,39 +331,27 @@ fn oversized_records_are_rejected() {
     wal.close().unwrap();
 }
 
-#[test]
-fn creating_an_existing_segment_fails() {
-    let dir = TmpDir::new("collision");
-    let first = WalWriter::new(dir.path(), "test.wal").unwrap();
-
-    // Two writers appending to one segment produce a log that cannot be read
-    // back, so this is refused rather than resumed.
-    assert!(matches!(
-        WalWriter::new(dir.path(), "test.wal"),
-        Err(WriteError::AlreadyExists { .. })
-    ));
-
-    first.close().unwrap();
-}
-
 // --- visibility -------------------------------------------------------------
 
 #[test]
 fn records_are_invisible_until_flushed() {
     let dir = TmpDir::new("visibility");
-    let mut wal = WalWriter::new(dir.path(), "test.wal").unwrap();
+    let mut wal = WalWriter::new(dir.path()).unwrap();
     wal.push(b"hello").unwrap();
     let path = wal.path().to_path_buf();
 
     assert_eq!(wal.unflushed_bytes(), FRAME as usize);
     assert_eq!(wal.unsynced_bytes(), 0);
-    assert!(read_all(&path).is_empty(), "unflushed records must not be visible");
+    assert!(
+        read_file(&path).is_empty(),
+        "unflushed records must not be visible"
+    );
 
     wal.flush().unwrap();
     assert_eq!(wal.unflushed_bytes(), 0);
     assert_eq!(wal.unsynced_bytes(), FRAME as usize);
 
-    let results = read_all(&path);
+    let results = read_file(&path);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].as_ref().unwrap(), b"hello");
 
@@ -351,7 +361,7 @@ fn records_are_invisible_until_flushed() {
 #[test]
 fn sync_flushes_first_and_clears_both_watermarks() {
     let dir = TmpDir::new("sync");
-    let mut wal = WalWriter::new(dir.path(), "test.wal").unwrap();
+    let mut wal = WalWriter::new(dir.path()).unwrap();
     wal.push(b"hello").unwrap();
     assert_eq!(wal.unflushed_bytes(), FRAME as usize);
 
@@ -362,5 +372,138 @@ fn sync_flushes_first_and_clears_both_watermarks() {
 
     let path = wal.path().to_path_buf();
     wal.close().unwrap();
-    assert_eq!(read_all(&path).len(), 1);
+    assert_eq!(read_file(&path).len(), 1);
+}
+
+// --- directory identity -----------------------------------------------------
+
+#[test]
+fn restart_creates_the_next_segment() {
+    let dir = TmpDir::new("restart");
+    let mut first = WalWriter::new(dir.path()).unwrap();
+    first.push(b"one").unwrap();
+    assert!(first.path().ends_with("00000001.wal"));
+    first.close().unwrap();
+
+    let mut second = WalWriter::new(dir.path()).unwrap();
+    assert_eq!(second.push(b"two").unwrap(), 0);
+    assert!(second.path().ends_with("00000002.wal"));
+    second.close().unwrap();
+
+    let records: Vec<_> = read_dir(dir.path())
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(records, vec![b"one".to_vec(), b"two".to_vec()]);
+}
+
+#[test]
+fn reader_concatenates_segments_in_seq_order() {
+    let dir = TmpDir::new("concat");
+    segment(&dir, &[b"a", b"b"]);
+    let mut wal = WalWriter::new(dir.path()).unwrap();
+    wal.push(b"c").unwrap();
+    wal.close().unwrap();
+
+    let records: Vec<_> = read_dir(dir.path())
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(records, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[test]
+fn foreign_dirents_are_ignored() {
+    let dir = TmpDir::new("foreign");
+    fs::write(dir.path().join(".DS_Store"), b"noise").unwrap();
+    fs::write(dir.path().join("test.wal"), b"nope").unwrap();
+    segment(&dir, &[b"hello"]);
+
+    let records: Vec<_> = read_dir(dir.path())
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(records, vec![b"hello".to_vec()]);
+}
+
+#[test]
+fn planted_high_seq_is_a_missing_first_segment() {
+    let dir = TmpDir::new("planted");
+    fs::write(dir.path().join("00000099.wal"), b"").unwrap();
+
+    assert!(matches!(
+        WalWriter::new(dir.path()),
+        Err(WriteError::MissingSegment { seq: 1 })
+    ));
+    assert!(matches!(
+        WalReader::open(dir.path()),
+        Err(ReadError::MissingSegment { seq: 1 })
+    ));
+}
+
+#[test]
+fn gap_in_the_middle_is_a_missing_segment() {
+    let dir = TmpDir::new("gap");
+    segment(&dir, &[b"one"]);
+    let mut wal = WalWriter::new(dir.path()).unwrap();
+    wal.push(b"two").unwrap();
+    wal.close().unwrap();
+    fs::remove_file(dir.path().join("00000002.wal")).unwrap();
+    fs::write(dir.path().join("00000003.wal"), b"").unwrap();
+
+    assert!(matches!(
+        WalWriter::new(dir.path()),
+        Err(WriteError::MissingSegment { seq: 2 })
+    ));
+    assert!(matches!(
+        WalReader::open(dir.path()),
+        Err(ReadError::MissingSegment { seq: 2 })
+    ));
+}
+
+#[test]
+fn torn_non_last_segment_fuses_the_reader() {
+    let dir = TmpDir::new("orphan");
+    let first = segment(&dir, &[b"hello", b"world"]);
+    truncate_to(&first, FRAME + 2);
+
+    let mut wal = WalWriter::new(dir.path()).unwrap();
+    wal.push(b"orphan").unwrap();
+    wal.close().unwrap();
+
+    let results = read_dir(dir.path());
+    assert_eq!(results[0].as_ref().unwrap(), b"hello");
+    assert!(matches!(
+        results[1],
+        Err(ReadError::TruncatedTail { offset: 13, .. })
+    ));
+    assert_eq!(results.len(), 2, "later segments must stay unreachable");
+}
+
+#[test]
+fn rotating_push_resets_offset_and_changes_path() {
+    let dir = TmpDir::new("rotate");
+    let mut wal = WalWriter::new(dir.path()).unwrap();
+    let first = wal.path().to_path_buf();
+    let payload = vec![b'x'; 1024 * 1024];
+    let mut rotated = false;
+    for _ in 0..200 {
+        let offset = wal.push(&payload).unwrap();
+        if wal.path() != first.as_path() {
+            assert_eq!(offset, 0);
+            assert!(wal.path().ends_with("00000002.wal"));
+            rotated = true;
+            break;
+        }
+    }
+    assert!(rotated, "writer never rotated");
+    assert!(
+        !read_file(&first).is_empty(),
+        "rotation must flush the sealed file"
+    );
+    wal.close().unwrap();
+
+    let records = read_dir(dir.path());
+    assert!(records.iter().all(|r| r.as_ref().unwrap() == &payload));
+    assert!(records.len() >= 2);
 }

@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join(format!("wal-demo-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
 
-    let mut wal = WalWriter::new(&dir, "demo.wal")?;
+    let mut wal = WalWriter::new(&dir)?;
     for i in 0..5 {
         let offset = wal.push(format!("record {i}").as_bytes())?;
         println!(
@@ -16,15 +16,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let path = wal.path().to_path_buf();
     wal.close()?;
-    println!("\nsegment: {}\n", path.display());
+    println!("\nlog: {}\n", dir.display());
 
-    for record in WalReader::open(&path)?.strings() {
+    for record in WalReader::open(&dir)?.strings() {
         match record {
             Ok(s) => println!("read: {s}"),
-            Err(ReadError::TruncatedTail { offset }) => {
-                println!("log ends mid-frame at {offset} (a crash landed here)");
+            Err(ReadError::TruncatedTail { path, offset }) => {
+                println!(
+                    "log ends mid-frame in {} at {offset} (a crash landed here)",
+                    path.display()
+                );
                 break;
             }
             Err(e) => {
