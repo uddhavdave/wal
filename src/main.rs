@@ -1,4 +1,4 @@
-use std::{option, path::Path};
+use std::path::Path;
 
 use wal_writer::{ReadError, WalOptions, WalReader, WalWriter};
 
@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_segment_size: 1024 * 1024 * 5,
         buffer_capactiy: 1024 * 4,
     };
-    let mut wal = WalWriter::with_options(&dir, option)?;
+    let mut wal = WalWriter::with_options(&dir, Some(options))?;
     for i in 0..5 {
         let offset = wal.push(format!("record {i}").as_bytes())?;
         println!(

@@ -11,7 +11,7 @@ pub struct WalOptions {
     pub buffer_capactiy: u64,
 }
 
-pub(crate) const MAX_SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
 
 /// An append handle for a WAL directory.
 ///
@@ -72,7 +72,7 @@ impl WalWriter {
             max_segment_size,
             buffer_capactiy: buffer_capacity,
         } = options.unwrap_or(WalOptions {
-            max_segment_size: MAX_SEGMENT_SIZE,
+            max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
             buffer_capactiy: DEFAULT_CAPACITY as u64,
         });
 
