@@ -29,6 +29,7 @@ pub enum WriteError {
     RecordTooLarge {
         len: usize,
     },
+    SegmentSizeNotFit,
 }
 
 impl fmt::Display for WriteError {
@@ -46,6 +47,10 @@ impl fmt::Display for WriteError {
                 f,
                 "wal write: record of {len} bytes exceeds the {} byte maximum",
                 crate::format::MAX_RECORD_SIZE
+            ),
+            WriteError::SegmentSizeNotFit => write!(
+                f,
+                "wal writer max segment size is too small to fit the max record"
             ),
         }
     }

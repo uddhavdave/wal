@@ -6,12 +6,12 @@ use crate::error::WriteError;
 use crate::format::{DEFAULT_CAPACITY, FRAME_OVERHEAD, MAX_RECORD_SIZE, checksum};
 use crate::segment::{MAX_SEGMENT_SEQ, ScanError, last_seq, segment_name};
 
-/// Largest a live segment may grow, in bytes. Tuning, not format: a reader
-/// concatenates whatever files are there, so this can change without breaking
-/// existing logs. Kept crate-private so it is not a constructor knob.
-pub(crate) const MAX_SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
+pub struct WalOptions {
+    pub max_segment_size: u64,
+    pub buffer_capactiy: u64,
+}
 
-const _: () = assert!(MAX_SEGMENT_SIZE >= MAX_RECORD_SIZE as u64 + FRAME_OVERHEAD as u64);
+pub(crate) const MAX_SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
 
 /// An append handle for a WAL directory.
 ///
@@ -46,6 +46,7 @@ pub struct WalWriter {
     /// Logical offset of the live segment known to be on disk.
     synced_offset: u64,
     closed: bool,
+    max_segment_size: u64,
 }
 
 impl WalWriter {
@@ -59,27 +60,40 @@ impl WalWriter {
     /// Fails with [`WriteError::AlreadyExists`] if two writers race to create
     /// the same next name.
     pub fn new(dir: &Path) -> Result<Self, WriteError> {
-        Self::with_capacity(dir, DEFAULT_CAPACITY)
+        Self::with_options(dir, None)
     }
 
-    /// Like [`new`](Self::new), with an explicit userspace buffer size.
+    /// Like [`new`](Self::new), with an explicit option to set max_segment_size and userspace buffer size.
     ///
     /// The buffer is pure runtime tuning — no reader can observe it — so unlike
     /// [`MAX_RECORD_SIZE`] it is safe to vary per writer.
-    pub fn with_capacity(dir: &Path, capacity: usize) -> Result<Self, WriteError> {
+    pub fn with_options(dir: &Path, options: Option<WalOptions>) -> Result<Self, WriteError> {
+        let WalOptions {
+            max_segment_size,
+            buffer_capactiy: buffer_capacity,
+        } = options.unwrap_or(WalOptions {
+            max_segment_size: MAX_SEGMENT_SIZE,
+            buffer_capactiy: DEFAULT_CAPACITY as u64,
+        });
+
+        if max_segment_size < MAX_RECORD_SIZE as u64 + FRAME_OVERHEAD as u64 {
+            return Err(WriteError::SegmentSizeNotFit);
+        }
+
         let last = match last_seq(dir) {
             Ok(n) => n,
             Err(ScanError::Io(e)) => return Err(e.into()),
             Err(ScanError::Missing { seq }) => return Err(WriteError::MissingSegment { seq }),
         };
         let seq = last + 1;
-        let (file, path) = create_segment(dir, seq, capacity)?;
+        let (file, path) = create_segment(dir, seq, buffer_capacity as usize)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             seq,
             file,
             path,
-            capacity,
+            capacity: buffer_capacity as usize,
+            max_segment_size,
             offset: 0,
             synced_offset: 0,
             closed: false,
@@ -103,7 +117,7 @@ impl WalWriter {
         }
 
         let frame_len = (FRAME_OVERHEAD + record.len()) as u64;
-        if self.offset + frame_len > MAX_SEGMENT_SIZE {
+        if self.offset + frame_len > self.max_segment_size {
             if self.offset == 0 {
                 // Unreachable while MAX_SEGMENT_SIZE >= MAX_RECORD_SIZE + overhead.
                 return Err(WriteError::RecordTooLarge { len: record.len() });

@@ -63,4 +63,4 @@ mod writer;
 pub use error::{ReadError, WriteError};
 pub use format::MAX_RECORD_SIZE;
 pub use reader::{Strings, WalReader};
-pub use writer::WalWriter;
+pub use writer::{WalOptions, WalWriter};
